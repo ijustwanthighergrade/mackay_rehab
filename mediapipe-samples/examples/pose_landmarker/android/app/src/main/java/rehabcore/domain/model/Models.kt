@@ -22,7 +22,8 @@ data class RepLog(                 // 對應 Python 的 [CALF LOG] / [SQUAT LOG]
     val holdSec: Float,
     val outcome: String,
     val side: String? = null,
-    val minAngleThisRep: Float? = null // 深蹲可用
+    val minAngleThisRep: Float? = null, // 深蹲可用
+    val epochMs: Long = 0L            // ← 新增：以 System.currentTimeMillis() 寫入
 )
 
 @Serializable

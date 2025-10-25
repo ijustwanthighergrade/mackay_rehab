@@ -69,7 +69,8 @@ apply from: 'download_tasks.gradle'
 dependencies {
     coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.2"
     implementation "com.github.android:renderscript-intrinsics-replacement-toolkit:b6363490c3"
-
+    implementation "androidx.lifecycle:lifecycle-runtime-ktx:2.8.6"   // 版本依你的專案
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1"
     // Kotlin lang
     implementation 'androidx.core:core-ktx:1.8.0'
 

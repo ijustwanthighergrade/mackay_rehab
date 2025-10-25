@@ -1,7 +1,6 @@
 package rehabcore.domain
 
 import rehabcore.domain.model.*
-import rehabcore.domain.Logger
 import kotlin.math.*
 enum class SideMode { LEFT, RIGHT, AUTO }
 
@@ -35,6 +34,9 @@ class SquatDetector(
 
     override fun getCounts(): Triple<Int, Int, Int> = Triple(success, fail, success + fail)
     override fun drainRepLogs(): List<RepLog> = repLogs.toList()
+
+    override fun peekRecentRepLogs(limit: Int): List<RepLog> =
+        if (repLogs.size <= limit) repLogs.toList() else repLogs.takeLast(limit)
 
     override fun onFrame(
         landmarks: PoseLandmarks,
@@ -91,7 +93,8 @@ class SquatDetector(
             peakDeg = null,
             holdSec = 0f,
             outcome = outcome,
-            minAngleThisRep = minAngleThisRep
+            minAngleThisRep = minAngleThisRep,
+            epochMs = System.currentTimeMillis()
         )
         Logger.logSquat(minAngleThisRep, outcome)
         minAngleThisRep = 999f

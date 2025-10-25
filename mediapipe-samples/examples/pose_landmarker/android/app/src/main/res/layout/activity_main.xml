@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/rootLayout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="24dp">
+
+    <Button
+        android:id="@+id/buttonSquat"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="深蹲" />
+
+    <Button
+        android:id="@+id/buttonCalf"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="提踵"
+        android:layout_marginTop="16dp" />
+
+    <Button
+        android:id="@+id/buttonRehabCalf"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="復健提踵"
+        android:layout_marginTop="16dp" />
+
+</LinearLayout>

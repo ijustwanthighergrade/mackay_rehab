@@ -11,4 +11,5 @@ interface Detector {
     fun drainRepLogs(): List<RepLog>
     /** 重置狀態（開始新 session 用） */
     fun reset()
+    fun peekRecentRepLogs(limit: Int = 10): List<RepLog>   // ← 新增
 }

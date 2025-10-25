@@ -43,29 +43,29 @@ class SkeletonOverlay(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val points = lm?.points ?: return
-        if (points.isEmpty()) return
+        val pts = lm?.points ?: return
+        if (pts.isEmpty()) return
 
-        // 偵測是否為 normalized (0..1)
-        val maxX = points.values.maxOf { it.x }
-        val maxY = points.values.maxOf { it.y }
+        // 偵測是否已是 0..1 normalized
+        val maxX = pts.values.maxOf { it.x }
+        val maxY = pts.values.maxOf { it.y }
         val isNorm = (maxX <= 2f && maxY <= 2f)
 
-        fun toNormX(x: Float) = if (isNorm) x else (x / frameW.toFloat().coerceAtLeast(1f))
-        fun toNormY(y: Float) = if (isNorm) y else (y / frameH.toFloat().coerceAtLeast(1f))
+        fun nx(x: Float) = if (isNorm) x else x / frameW.coerceAtLeast(1).toFloat()
+        fun ny(y: Float) = if (isNorm) y else y / frameH.coerceAtLeast(1).toFloat()
 
-        // 邊
+        // 畫骨架線
         for ((a, b) in edges) {
-            val pa = points[a]; val pb = points[b]
+            val pa = pts[a]; val pb = pts[b]
             if (visible(pa) && visible(pb)) {
-                val (x1, y1) = normToView(toNormX(pa!!.x), toNormY(pa.y))
-                val (x2, y2) = normToView(toNormX(pb!!.x), toNormY(pb.y))
+                val (x1, y1) = normToView(nx(pa!!.x), ny(pa.y))
+                val (x2, y2) = normToView(nx(pb!!.x), ny(pb.y))
                 canvas.drawLine(x1, y1, x2, y2, bone)
             }
         }
-        // 點
-        for ((_, p) in points) if (visible(p)) {
-            val (cx, cy) = normToView(toNormX(p!!.x), toNormY(p.y))
+        // 畫關節點
+        for ((_, p) in pts) if (visible(p)) {
+            val (cx, cy) = normToView(nx(p.x), ny(p.y))
             canvas.drawCircle(cx, cy, 6f, joint)
         }
     }
