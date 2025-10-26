@@ -68,6 +68,16 @@ class CalfDetector(
 
     // —— Δ角用：回合起始絕對角（在進 RAISING 那一刻鎖定） —— //
     private var repBaseDeg: Float = 0f
+    // —— 冷卻期追蹤 —— //
+    private var cooldownLowFrames = 0
+    private var cooldownStartMs: Long? = null
+
+    private var raiseStartMs: Long = 0L
+    private var minAbsDuringRaise: Float = Float.MAX_VALUE
+
+    // —— HOLDING 抗抖動 —— //
+    private var holdLowFrames = 0
+    private var holdLowStartMs = 0L
 
     override fun reset() {
         state = S.CALIB
@@ -166,6 +176,7 @@ class CalfDetector(
             val heelLiftProxy = abs(heelY - toeY)
             val angleProxy = atan2(heelLiftProxy, Lraw) * 180f / Math.PI.toFloat()
 
+
             if (calibStartMs == null) calibStartMs = System.currentTimeMillis()
             val waitedMs = System.currentTimeMillis() - calibStartMs!!
 
@@ -184,7 +195,7 @@ class CalfDetector(
             val okByTimeout = waitedMs >= timeoutMs &&
                     toeSpeed  <= params.standStillSpeedPx * 2f &&
                     heelSpeed <= params.standStillSpeedPx * 2f
-            val longEnough  = Lraw >= kotlin.math.max(params.minFootLenPx, params.minFootLenRatio * height)
+            val longEnough  = Lraw >= params.minFootLenPx
             val okByFallback = waitedMs >= 4000L && longEnough
 
             if ((okByFrames || okByTimeout || okByFallback) && longEnough) {
@@ -219,7 +230,9 @@ class CalfDetector(
                     "peakDeltaDeg" to peakDeg,
                     "fps" to smoothFps(nowNanos),
                     "holdTarget" to params.holdSeconds,
-                    "smallHoldSec" to smallHoldSec
+                    "smallHoldSec" to smallHoldSec,
+                    "canRaise" to canRaise,
+                    "restFrames" to restFrames
                 )
             )
         }
@@ -231,29 +244,42 @@ class CalfDetector(
         val bx = baseHeelX ?: return FrameHud(null, state.name, holdSec, success, fail)
         val by = baseHeelY ?: return FrameHud(null, state.name, holdSec, success, fail)
 
-        val ABx = bx - ax; val ABy = by - ay
-        val APx_h = heelX - ax; val APy_h = heelY - ay
-        val cross_h = abs(APx_h * ABy - APy_h * ABx)
-        val heelLift = (cross_h / max(1f, hypot(ABx, ABy))).toFloat()
+// 基線 AB（校正鎖定），P = 當前 heel
+        val ABx = bx - ax
+        val ABy = by - ay
+        val APx = heelX - ax
+        val APy = heelY - ay
+
+// heel 對基線之垂距（像素）
+        val cross    = abs(APx * ABy - APy * ABx)
+        val heelLift = cross / max(1f, hypot(ABx, ABy))
+
 
         if (params.enforceToeGround && state == S.HOLDING) {
             val APx_t = toeX - ax; val APy_t = toeY - ay
             val cross_t = abs(APx_t * ABy - APy_t * ABx)
             val toeLift = (cross_t / max(1f, hypot(ABx, ABy))).toFloat()
-            val toeLiftLimit = max(max(params.calibJitterPx, params.calibJitterRatio * height), L * 0.03f)
+            val toeLiftLimit = max(params.calibJitterPx, L * params.toeLiftMaxRatio)
             if (toeLift > toeLiftLimit) {
                 commitFail("TOE_OFF_GROUND", windowHoldSec)
                 state = S.COOLDOWN
+                cooldownStartMs = System.currentTimeMillis()
+                cooldownLowFrames = 0
                 holdSec = 0f; windowHoldSec = 0f; smallHoldSec = 0f
             }
         }
 
+        // 當前「絕對角」（度）
         val thetaAbs = atan2(heelLift, L) * 180f / Math.PI.toFloat()
+
+        // EMA 平滑 + 上限鉗制
         emaAngle = if (emaAngle == null) thetaAbs else (params.emaAlpha * thetaAbs + (1 - params.emaAlpha) * emaAngle!!)
         val absAngle = min(emaAngle!!, params.angleNoiseMax)   // 絕對角（鉗制後）
 
-        // ★ 核心：Δ角（以「進 RAISING 時的絕對角」為基準）
+        // Δ角（以回到 IDLE 時鎖的基準角為 0）
         val deltaDeg = max(0f, absAngle - repBaseDeg)
+        val deltaRaw = max(0f, thetaAbs - repBaseDeg)  // 用原始角判斷是否已達 7.5°
+
         val dt = lastDtSec(nowNanos)
 
         // ===== 狀態機（以 Δ角判斷） =====
@@ -263,53 +289,79 @@ class CalfDetector(
                 if (state == S.CALIB) return FrameHud(null, "CALIB", 0f, success, fail)
 
                 // 起跳 gating：低角度休息一段時間
-                val restNeedFrames = max(3, (params.restNeedSec * fps).toInt())
+                val restNeedFrames = max(2, (params.restNeedSec * smoothFps(nowNanos)).toInt()) // ★ 修正：用平滑 fps，且最低只需 2 幀
                 if (deltaDeg <= params.idleThreshold) {
                     if (restFrames < restNeedFrames) restFrames++
                     if (restFrames >= restNeedFrames) canRaise = true
                 } else {
-                    restFrames = 0
-                    canRaise = false
-                }
+                    if (deltaDeg > params.idleThreshold + 1.5f) {
+                        restFrames = 0
+                        // ★ 修正：不要馬上把 canRaise 打回 false，保留 0.3 秒寬限（避免一點點雜訊失去資格）
+                        if (canRaise) {
+                            // do nothing; 在短時間內保留 canRaise 資格
+                        } else {
+                            canRaise = false
+                        }
+                    }
+              }
 
                 holdSec = 0f; windowHoldSec = 0f; smallHoldSec = 0f
                 baseDeg = repBaseDeg    // 顯示/輸出時的回合基準角
 
+            // ★ 修正：兩條路可以進 RAISING
+            // 1) 正常：已休息夠，且 Δ角 ≥ max(idleThreshold, raiseEnterDeg)
+            // 2) 例外：尚未滿足休息，但 Δ角已達 aMin+2° 且持續 > fastRaiseOverrideSec（快速抬腳的使用者）
                 val raiseEnter = max(params.raiseEnterDeg, params.idleThreshold)
-                if (canRaise && deltaDeg >= raiseEnter) {
+                val canEnterByRest = canRaise && deltaDeg >= raiseEnter
+                val canEnterByFast = deltaDeg >= (params.aMin + 2f)
+                if (canEnterByRest || canEnterByFast) {
                     recordStateChange(state, S.RAISING, 0f)
                     state = S.RAISING
-                    repBaseDeg = absAngle           // ★ 鎖定回合起點角（之後 Δ角用它）
                     baseDeg = repBaseDeg
                     peakDeg = 0f
-                    canRaise = false
                     restFrames = 0
+                    canRaise = false
+                    raiseStartMs = System.currentTimeMillis()
+                    minAbsDuringRaise = absAngle
                 }
             }
 
             S.RAISING -> {
                 peakDeg = max(peakDeg, deltaDeg)
+// ★ 起跳後前 0.25s 把回合基準往下校正到這段時間的最小角，避免一開始站姿不夠平
+                minAbsDuringRaise = min(minAbsDuringRaise, absAngle)
+                val raiseElapsed = (System.currentTimeMillis() - raiseStartMs) / 1000f
+                if (raiseElapsed <= 0.25f) {
+                    if (minAbsDuringRaise < repBaseDeg) {
+                        repBaseDeg = minAbsDuringRaise
+                    }
+                }
 
                 val inSmall = deltaDeg >= params.idleThreshold && deltaDeg < params.aMin
                 if (inSmall) {
                     smallHoldSec += dt
                     if (smallHoldSec >= params.holdSeconds) {
-                        commitFail("FAIL_SMALL_KEPT", smallHoldSec)
+                        if (params.countSmallAsFail) {
+                            commitFail("FAIL_SMALL_KEPT", smallHoldSec) // 只有打開參數才記為失敗
+                        }
                         recordStateChange(state, S.COOLDOWN, deltaDeg)
                         state = S.COOLDOWN
+                        cooldownStartMs = System.currentTimeMillis()
+                        cooldownLowFrames = 0
                         smallHoldSec = 0f; holdSec = 0f; windowHoldSec = 0f
                     }
                 }
 
-                if (!inSmall && deltaDeg >= params.aMin) {
-                    recordStateChange(state, S.HOLDING, deltaDeg)
+                // ★ 用原始角 deltaRaw 進 HOLDING，避免 EMA 把門檻抹掉
+                if (!inSmall && deltaRaw  >= params.aMin) {
+                    recordStateChange(state, S.HOLDING, deltaRaw)
                     state = S.HOLDING
                     windowHoldSec = 0f
                     holdSec = 0f
                     smallHoldSec = 0f
                 } else if (!inSmall && deltaDeg < params.idleThreshold) {
                     recordStateChange(state, S.IDLE, deltaDeg)
-                    enterIdle(deltaDeg, toeX, toeY, heelX, heelY)
+                    enterIdle(absAngle, toeX, toeY, heelX, heelY)
                     holdSec = 0f; windowHoldSec = 0f; smallHoldSec = 0f
                 }
             }
@@ -317,29 +369,61 @@ class CalfDetector(
             S.HOLDING -> {
                 peakDeg = max(peakDeg, deltaDeg)
 
-                if (deltaDeg in params.aMin..params.aMax) {
+                val tol = params.holdBandToleranceDeg
+                val inBand = deltaDeg >= (params.aMin - tol) && deltaDeg <= (params.aMax + tol)
+
+                if (inBand) {
                     windowHoldSec += dt
                     holdSec = windowHoldSec
                 } else if (deltaDeg >= params.idleThreshold) {
-                    windowHoldSec = 0f
-                    holdSec = 0f
+                    // 超出窗口但仍高於 idleThreshold：視為仍在抬腳，暫停計時但不清零
+                    if (deltaDeg > params.aMax + tol) { // 只有嚴重超標才歸零
+                        windowHoldSec = 0f
+                        holdSec = 0f
+                    }
+                    // 只要 >= idleThreshold 就把「低角統計」重置
+                    holdLowFrames = 0
+                    holdLowStartMs = 0L
                 }
 
+                // ★ 抗抖動：連續低於 idleThreshold 才離場
                 if (deltaDeg < params.idleThreshold) {
-                    recordStateChange(state, S.COOLDOWN, deltaDeg)
-                    finalizeRep(successOverride = windowHoldSec >= params.holdSeconds)
-                    state = S.COOLDOWN
+                    holdLowFrames++
+                    if (holdLowStartMs == 0L) holdLowStartMs = System.currentTimeMillis()
+                    val lowElapsed = (System.currentTimeMillis() - holdLowStartMs) / 1000f
+
+                    if (holdLowFrames >= params.holdExitBelowFrames || lowElapsed >= params.holdDropGraceSec) {
+                        recordStateChange(state, S.COOLDOWN, deltaDeg)
+                        finalizeRep(successOverride = windowHoldSec >= params.holdSeconds)
+                        state = S.COOLDOWN
+                        cooldownStartMs = System.currentTimeMillis()
+                        cooldownLowFrames = 0
+                        holdLowFrames = 0
+                        holdLowStartMs = 0L
+                    }
+                } else {
+                    // 回到 >= idleThreshold，低角統計清零
+                    holdLowFrames = 0
+                    holdLowStartMs = 0L
                 }
             }
+
 
             S.COOLDOWN -> {
-                // 回到很低 Δ角才算真的放下
-                if (deltaDeg < params.idleThreshold * 0.7f) {
+                // ★ 更寬鬆的退場條件 + 上限秒數，避免卡死在 COOLDOWN
+                if (cooldownStartMs == null) cooldownStartMs = System.currentTimeMillis()
+                val elapsed = (System.currentTimeMillis() - cooldownStartMs!!) / 1000f
+
+                val lowEnough = deltaDeg < params.idleThreshold // 低於 idleThreshold (=6°) 即可
+                val timeout   = elapsed >= 1.0f                 // 或滿 1 秒強制回 IDLE
+
+                if (lowEnough || timeout) {
                     recordStateChange(state, S.IDLE, deltaDeg)
-                    enterIdle(deltaDeg, toeX, toeY, heelX, heelY)
-                    smallHoldSec = 0f
+                    enterIdle(absAngle, toeX, toeY, heelX, heelY)
+                    cooldownStartMs = null
                 }
             }
+
 
             S.CALIB -> { /* 已在上面 return */ }
         }
@@ -352,6 +436,9 @@ class CalfDetector(
             success = success,
             fail = fail,
             extra = mapOf(
+                "toeX" to toeX, "toeY" to toeY,
+                "heelX" to heelX, "heelY" to heelY,
+
                 // 基線資訊
                 "baseToeX" to ax, "baseToeY" to ay,
                 "baseHeelX" to bx, "baseHeelY" to by,
@@ -364,7 +451,9 @@ class CalfDetector(
                 "peakDeltaDeg" to peakDeg,
                 "fps" to smoothFps(nowNanos),
                 "holdTarget" to params.holdSeconds,
-                "smallHoldSec" to smallHoldSec
+                "smallHoldSec" to smallHoldSec,
+                "canRaise" to canRaise,
+                "restFrames" to restFrames
             )
         )
         return hud
@@ -548,7 +637,7 @@ class CalfDetector(
     }
 
     private fun enterIdle(
-        angleNow: Float,
+        absAngleNow: Float,
         toeX: Float? = null, toeY: Float? = null,
         heelX: Float? = null, heelY: Float? = null
     ) {
@@ -561,8 +650,27 @@ class CalfDetector(
         stationaryConsec = 0
         toeX?.let { lastToeX = it }; toeY?.let { lastToeY = it }
         heelX?.let { lastHeelX = it }; heelY?.let { lastHeelY = it }
+// reset gating/timers for next cycle
+        restFrames = 0
+        canRaise = false
+        windowHoldSec = 0f
+        holdSec = 0f
         smallHoldSec = 0f
-        // 不在這裡動 repBaseDeg，讓下一次進 RAISING 再鎖
+
+//        // ★ 新增：在休息狀態鎖定下一輪 Δ角基準
+//        repBaseDeg = if (emaAngle != null) emaAngle!!.coerceAtLeast(0f) else absAngleNow.coerceAtLeast(0f)
+//        baseDeg = repBaseDeg
+        // 改成（僅在回到低角度時才鎖基準；否則沿用上一輪基準）
+        val lowNow = absAngleNow <= params.idleThreshold + 0.5f
+        repBaseDeg = if (lowNow) (emaAngle ?: absAngleNow).coerceAtLeast(0f) else repBaseDeg
+
+//        repBaseDeg = if (lowNow) {
+//            (emaAngle ?: absAngleNow).coerceAtLeast(0f)
+//        } else {
+//            // 仍偏高：暫不更新，避免把“非休息位”當作新基準
+//            repBaseDeg
+//        }
+        baseDeg = repBaseDeg
     }
 
     private fun lastDtSec(nowNs: Long): Float {
