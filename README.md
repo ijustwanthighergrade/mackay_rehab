@@ -437,3 +437,225 @@ override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) 
 
 👤 **維護責任人**：Mackay Rehab R&D  
 📅 文件更新日期：2025/10/27
+## 🔗 實際整合指南（依原程式架構）
+
+此專案的整合與資料匯出並非透過 API 呼叫，而是由 `DetectionActivity` 與 `SessionResultWriter` 協同完成。以下為依據實際程式架構撰寫的整合流程說明。
+
+---
+
+### 🧩 結構總覽
+整合邏輯主線：
+```
+DetectionActivity → DetectionViewModel → Detector(動作邏輯)
+                 ↓
+           SessionResultWriter.save()
+                 ↓
+           JSON 檔案輸出（rehab-sessions/）
+```
+由 `DetectionActivity` 在運動結束時呼叫 `writeSessionFiles()`，收集運動統計並交由 `SessionResultWriter` 序列化成 JSON。
+
+---
+
+### 🧭 匯出邏輯
+[`app/data/SessionResultWriter.kt`](mediapipe-samples/examples/pose_landmarker/android/app/src/main/java/app/data/SessionResultWriter.kt:17)
+
+#### 1️⃣ 檔案寫入核心
+```kotlin
+fun writeSafe(context, result: SessionResult, filename: String): Result<File>
+```
+- 建立目錄：`<filesDir>/rehab-sessions/`  
+- 將 `SessionResult` 物件序列化成 JSON  
+- 每次以時間戳命名（`session_yyyyMMdd_HHmmss.json`）
+
+> ⚠️ 若發生寫檔錯誤，回傳 `Result.failure(e)` 而非拋例外，主系統可安全接手處理。
+
+---
+
+#### 2️⃣ 統計匯出封裝
+```kotlin
+fun save(
+    context: Context,
+    action: String,
+    fps: Float,
+    params: Map<String, ParamValue>,
+    success: Int,
+    fail: Int,
+    total: Int,
+    successRate: Float,
+    reps: List<RepLog>,
+    framesSampled: Int
+)
+```
+該方法自動組裝 [`SessionResult`](mediapipe-samples/examples/pose_landmarker/android/app/src/main/java/rehabcore/domain/model/Models.kt:37) 物件並呼叫 `writeSafe()`。
+
+---
+
+### 🧠 SessionResult 結構說明
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| `action` | `String` | 動作類型 ("SQUAT", "CALF", "REHAB_CALF") |
+| `fps` | `Float` | 當前分析平均 FPS |
+| `params` | `Map<String, ParamValue>` | 當次使用的參數組（自 `DetectorParams`） |
+| `success/fail/total` | `Int` | 累計動作結果統計 |
+| `successRate` | `Float` | 成功率（success/total） |
+| `reps` | `List<RepLog>` | 回合詳細紀錄（角度、保持時間、成果） |
+| `framesSampled` | `Int` | 當次分析過的影格數 |
+
+---
+
+### 🗃️ 檔案輸出位置與命名規則
+匯出目錄：
+```
+/data/data/<package>/files/rehab-sessions/
+```
+檔名範例：
+```
+CALF-1697987523123.json
+session_20251027_154233.json
+```
+使用 `defaultFileName(prefix: "session")` 生成安全命名；所有結果皆為 UTF-8 JSON，行距格式化 (`prettyPrint=true`)。
+
+---
+
+### 📦 整合到主系統方式
+
+#### 情境 1 — 單機紀錄保存
+主系統僅需在 `DetectionActivity` 偵測結束後，檢查目錄中最新 JSON：
+```kotlin
+val dir = File(context.filesDir, "rehab-sessions")
+val latest = dir.listFiles()?.maxByOrNull { it.lastModified() }
+```
+即可取得最新 Session 結果資料。
+
+#### 情境 2 — 雲端同步
+利用 `SessionResultWriter.save()` 回傳的 `Result<File>`：
+```kotlin
+val resultFile = SessionResultWriter.save(context, action, fps, params, succ, fail, total, rate, reps, frames)
+if (resultFile.isSuccess) {
+    uploadSession(resultFile.getOrThrow())
+}
+```
+將 JSON 檔案以 Multipart / HTTPS 上傳即可。  
+
+#### 情境 3 — 即時資料橋接
+若主系統欲整合即時監控，可在 `DetectionActivity.hud` 更新時同步傳輸 HUD 狀態（angleDeg、state、holdSec），或透過 ViewModel LiveData 轉發。
+
+---
+
+### 🧾 整合重點摘要
+- 匯出由 `SessionResultWriter` 負責，無需額外 API。  
+- 檔案以 JSON 格式儲存於 App 內部安全路徑。  
+- 成功/失敗次數、FPS、角度、參數等皆封裝於單一 `SessionResult`。  
+- 外部主系統可：
+  - 直接讀檔以整合結果；
+  - 或於完成即時上傳。  
+- JSON 結構與統計欄位完全對應底層 domain 層模型。
+
+---
+## 🧭 實際整合說明（以彈窗視覺回饋為核心）
+
+目前專案在 [`DetectionActivity.kt`](mediapipe-samples/examples/pose_landmarker/android/app/src/main/java/app/ui/DetectionActivity.kt:313) 內部，**已內建完整的統計結果展示邏輯**。  
+返回按鍵（`backBtn`）會觸發 `showSessionConfirm()`，此函數即為結果整合與人工檢視的核心。  
+
+---
+
+### ⚙️ 功能概述
+
+在偵測結束、使用者點擊返回鍵時，系統會：
+1. 暫停 Camera 輸入與 Pose 偵測；
+2. 由 `DetectionViewModel` 取得：
+   - 成功 / 失敗 / 總次數；
+   - 各回合詳細 `RepLog`（動作紀錄）；
+3. 以直覺格式組成字串內容；
+4. 使用 `AlertDialog.Builder` 顯示彈窗視覺化匯整。
+
+---
+
+### 🧾 彈窗內容細節
+
+#### A) 運動結果統計
+
+| 欄位 | 含義 |
+|------|------|
+| **狀態 (state)** | 最後一幀 HUD 的狀態 (如 IDLE / HOLDING / COOLDOWN)。 |
+| **角度 (Δ angle)** | HUD 內紀錄的即時角度變化。 |
+| **成功/失敗/總數** | 由 ViewModel 回傳之即時統計。 |
+| **成功率 Success Rate (%)** | `(success / total * 100)` 的即時百分比計算。 |
+
+顯示範例：
+```
+狀態：HOLDING
+當前角度(Δ)：45.3°
+成功：12  失敗：3  總數：15
+成功率：80.0%
+```
+
+---
+
+#### B) 近 20 筆「狀態轉換紀錄」
+來自 `RepLog` 中 outcome 以 `"STATE_"` 開頭的項目，例如：
+```
+— 狀態變換紀錄 —
+• [12:22:41.583] STATE_IDLE_TO_RAISING @Δ=3.2°
+• [12:22:43.124] STATE_RAISING_TO_HOLDING @Δ=15.8°
+```
+
+可協助了解使用者在多少秒時進入維持狀態，或動作是否穩定。
+
+---
+
+#### C) 近 10 筆「回合結果紀錄」
+範例如下：
+```
+— 回合結果彙整 —
+• #1 [12:24:03.341] SUCCESS  base=2.5°  peakΔ=12.3°  hold=1.25s
+• #2 [12:25:02.033] FAIL_HOLD_SHORT  base=3.0°  peakΔ=8.4°  hold=0.57s
+```
+每回合輸出自 `RepLog` 的：
+- peakDeg (最高角度)
+- holdSec (持續時間)
+- outcome (成功或失敗類型)
+
+---
+
+### 🚀 整合到主系統的方式
+
+此彈窗目的即是「本地即視化」的結果整合層，**無需額外 JSON、API 或外部傳輸**。
+
+若主系統需直接讀取這些資料，有兩種方式：
+
+#### ✅ 方法一：透過 ViewModel 與回傳參數直接取值
+```kotlin
+val (succ, fail, total) = viewModel.getCounts()
+val repLogs = viewModel.peekRecentRepLogs(50)
+```
+即可取得成功率與歷史紀錄，彈窗組成的文字即以這些資料生成。
+
+#### ✅ 方法二：在返回動作中收集結果
+目前彈窗「儲存並離開」按鈕內部會返回：
+```kotlin
+setResult(RESULT_OK, Intent().putExtra("saved", true))
+```
+主系統可透過 `onActivityResult()` 監控是否儲存確認，進行流程接管或統計同步。
+
+---
+
+### 💡 延伸整合建議
+
+| 模式 | 操作方式 | 適用情境 |
+|------|-----------|----------|
+| 🔹 **臨床復健** | 直接使用彈窗輸出 | 醫師端立即觀察動作結果、時間、狀態變化 |
+| 🔹 **研究分析** | 改寫彈窗字串為表格或 CSV 文字 | 可複製貼到 Excel 或病歷系統無需額外 IO |
+| 🔹 **遠距監控** | 將 `getCounts()` 結果透過 BLE / Socket 傳出 | 適用於穿戴裝置長期追蹤目的 |
+
+---
+
+### 📋 總結要點
+
+- 此整合邏輯基於 **`DetectionActivity.showSessionConfirm()`** 本地彈窗統一呈現；
+- 所有核心數據（角度、回合結果、成功率）直接顯示在 UI；
+- 無需 JSON 或檔案輸出即可進行資料傳遞；
+- 主系統若要接管數據，僅需取得 `viewModel` 提供之計算函式；
+- 此設計確保安全性（不依檔案 IO）且使用者體驗即時直覺。
+
+---
